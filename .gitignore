@@ -1,0 +1,22 @@
+# Rust build output
+/target/
+
+# Release/package artifacts generated locally
+/dist/
+
+# Local Python environments and caches
+/.venv/
+/.venv-stock/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project-local agent/research artifacts that are not part of the TUI runtime
+/.codex/
+/.antigravitycli/
+
+# Local/editor noise
+.DS_Store
+*.log
