@@ -10,7 +10,8 @@ Rust terminal watchlist for A-share market quotes.
 - Live quote source: Tencent Finance `qt.gtimg.cn`.
 - Mock market data: removed. The UI only fills from real quote responses.
 - Polling: live cadence during regular A-share trading sessions; one snapshot refresh outside trading hours.
-- Chart panel: recent daily K-line history is shown when available; intraday chart rendering is not implemented yet.
+- Chart panel: intraday minute price/volume and recent daily K-line views are available when Tencent returns the data.
+- Scope: pure market-watch TUI. AI summaries, deep analysis pipelines, and local agent skills are intentionally excluded.
 
 ## Features
 
@@ -20,6 +21,7 @@ Rust terminal watchlist for A-share market quotes.
 - Stock table with price, change, and percentage change.
 - Detail panel with open, previous close, high, low, volume, amount.
 - Level-5 bid/ask order book when returned by Tencent.
+- Intraday price/volume chart and daily K-line chart toggle.
 - Keyboard-driven add/delete/navigation workflow.
 
 ## Market Data Behavior
@@ -38,7 +40,7 @@ The polling loop requests data every `3s` during regular A-share sessions:
 Monday-Friday
 ```
 
-Outside trading hours it fetches one snapshot so the UI can still show the latest available quote snapshot, including the most recent close/open/high/low/volume fields returned by Tencent. It also fetches recent daily K-line history for configured watchlist stocks. After that, it only checks the clock every `60s` until the market opens, unless the watchlist codes change.
+Outside trading hours it fetches one snapshot so the UI can still show the latest available quote snapshot, including the most recent close/open/high/low/volume fields returned by Tencent. It also fetches recent daily K-line history and intraday minute points for configured watchlist stocks when available. After that, it only checks the clock every `60s` until the market opens, unless the watchlist codes change.
 
 Holiday calendars and ad-hoc market closures are not currently modeled.
 
@@ -69,7 +71,7 @@ The app opens in an alternate terminal screen. Press `q` to exit and return to y
 
 ### 2. Wait for live data
 
-The app does not show mock prices. During A-share trading hours it starts polling Tencent realtime quotes automatically. Outside trading hours it fetches once and shows the latest available quote snapshot and recent daily K-line history returned by Tencent.
+The app does not show mock prices. During A-share trading hours it starts polling Tencent realtime quotes automatically. Outside trading hours it fetches once and shows the latest available quote snapshot, intraday minute points, and recent daily K-line history returned by Tencent.
 
 Status messages at the bottom tell you whether the app is polling live quotes or has refreshed the closed-market snapshot.
 
@@ -134,6 +136,7 @@ When live data is available:
 - Left table shows code, name, last price, change, and percent change.
 - Right detail panel shows open, previous close, high, low, volume, and amount.
 - Right order-book panel shows five-level bid/ask prices and volumes.
+- Bottom chart panel toggles between intraday price/volume and daily K-line views with `t`.
 
 Useful development commands:
 
@@ -223,7 +226,6 @@ The Rust TUI currently uses Tencent realtime quote and K-line endpoints. No AI s
 
 ## Limitations
 
-- No real intraday chart yet; recent daily K-line history is displayed as a compact table.
 - No holiday calendar; weekend/time-window rules only.
 - The `r` key updates status text but does not yet trigger an immediate fetch.
 - Quote parsing depends on Tencent's field order and availability.
