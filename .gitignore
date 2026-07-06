@@ -16,6 +16,9 @@ __pycache__/
 # Project-local agent/research artifacts that are not part of the TUI runtime
 /.codex/
 /.antigravitycli/
+/TODO.md
+/ROADMAP.md
+/NOTES.md
 
 # Local/editor noise
 .DS_Store
