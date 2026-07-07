@@ -1,4 +1,6 @@
-use crate::app::{App, ChartMode, InputMode, KLine, MinutePoint, Stock};
+use crate::app::{
+    App, ChartMode, GroupNameAction, InputMode, KLine, LayoutMode, MinutePoint, QuoteMeta, Stock,
+};
 use ansi_parser::AnsiParser;
 use ratatui::{
     Frame,
@@ -19,6 +21,7 @@ const COLOR_UP: Color = Color::Red;
 const COLOR_DOWN: Color = Color::Green;
 const COLOR_EVEN: Color = Color::White;
 const INTRADAY_SESSION_X_MAX: f64 = 241.0;
+const KLINE_CANDLE_WIDTH: usize = 3;
 
 #[derive(Debug, Clone, Copy)]
 struct IntradayPlotPoint<'a> {
@@ -34,6 +37,13 @@ struct IntradayVolumePoint {
 }
 
 struct AnsiChart<'a>(&'a str);
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct IntradayStats {
+    high: f64,
+    low: f64,
+    pct_vs_prev_close: f64,
+}
 
 /// Renders ANSI-colored chart output into a Ratatui buffer.
 impl Widget for AnsiChart<'_> {
@@ -125,10 +135,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // 2. Render Main Body (Left: Watchlist, Right: Detail)
     let body_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([
-            Constraint::Percentage(40), // Left Watchlist
-            Constraint::Percentage(60), // Right Details & Chart
-        ])
+        .constraints(match app.layout_mode {
+            LayoutMode::Compact => [Constraint::Percentage(32), Constraint::Percentage(68)],
+            LayoutMode::LargeChart => [Constraint::Percentage(25), Constraint::Percentage(75)],
+            LayoutMode::OrderBook => [Constraint::Percentage(45), Constraint::Percentage(55)],
+            LayoutMode::Balanced => [Constraint::Percentage(40), Constraint::Percentage(60)],
+        })
         .split(chunks[1]);
 
     render_watchlist(f, app, body_chunks[0]);
@@ -140,6 +152,12 @@ pub fn render(f: &mut Frame, app: &mut App) {
     // 4. Render Search Dialog (if active)
     if app.input_mode == InputMode::Search {
         render_search_popup(f, app);
+    }
+
+    match &app.input_mode {
+        InputMode::GroupName(action) => render_group_name_popup(f, app, action),
+        InputMode::FilterText => render_filter_text_popup(f, app),
+        _ => {}
     }
 
     if app.show_opening_auction_popup {
@@ -249,7 +267,7 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
     f.render_widget(Paragraph::new(tabs_line), watchlist_chunks[0]);
 
     // Table Header
-    let header_cells = ["代码", "名称", "现价", "涨跌", "幅%"].iter().map(|h| {
+    let header_cells = ["代码", "名称", "现价", "幅%", "状态"].iter().map(|h| {
         Cell::from(*h).style(
             Style::default()
                 .add_modifier(Modifier::BOLD)
@@ -261,7 +279,10 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
     // Table Rows
     let mut rows = Vec::new();
     if let Some(group) = app.current_group() {
-        for (i, code) in group.stocks.iter().enumerate() {
+        for i in app.visible_stock_indices() {
+            let Some(code) = group.stocks.get(i) else {
+                continue;
+            };
             let is_selected = i == app.selected_stock_idx;
 
             // Check if we have dynamic data for this stock code
@@ -276,13 +297,17 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
 
                 let clean_code = code.replace("sh", "").replace("sz", "").replace("bj", "");
 
+                let marker = stock
+                    .anomaly_tag(app.highlight_thresholds)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| quote_state_label(app.quote_meta.get(code)));
                 vec![
                     Cell::from(clean_code),
                     Cell::from(stock.name.as_str()),
                     Cell::from(format!("{:.2}", stock.price)).style(Style::default().fg(color)),
-                    Cell::from(format!("{:+.2}", stock.change)).style(Style::default().fg(color)),
                     Cell::from(format!("{:+.2}%", stock.pct_change))
                         .style(Style::default().fg(color)),
+                    Cell::from(marker),
                 ]
             } else {
                 let clean_code = code.replace("sh", "").replace("sz", "").replace("bj", "");
@@ -291,7 +316,7 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
                     Cell::from("加载中..."),
                     Cell::from("--"),
                     Cell::from("--"),
-                    Cell::from("--"),
+                    Cell::from("缺数据"),
                 ]
             };
 
@@ -299,6 +324,12 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
                 Style::default()
                     .bg(Color::Rgb(40, 44, 52))
                     .add_modifier(Modifier::BOLD)
+            } else if app
+                .stock_data
+                .get(code)
+                .is_some_and(|stock| stock.is_anomaly(app.highlight_thresholds))
+            {
+                Style::default().bg(Color::Rgb(58, 32, 82))
             } else {
                 Style::default()
             };
@@ -312,12 +343,18 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
         Constraint::Length(12),
         Constraint::Length(10),
         Constraint::Length(8),
-        Constraint::Length(8),
+        Constraint::Length(10),
     ];
 
+    let title = format!(
+        " 自选股列表  排序:{}  过滤:{}  布局:{} ",
+        app.sort_mode.label(),
+        app.filter_mode.label(),
+        app.layout_mode.label()
+    );
     let table = Table::new(rows, widths).header(header).block(
         Block::default()
-            .title(" 自选股列表 ")
+            .title(title)
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray)),
     );
@@ -326,12 +363,14 @@ fn render_watchlist(f: &mut Frame, app: &App, rect: Rect) {
 }
 
 fn render_details(f: &mut Frame, app: &App, rect: Rect) {
+    let top_height = match app.layout_mode {
+        LayoutMode::LargeChart => 10,
+        LayoutMode::OrderBook => 18,
+        _ => 14,
+    };
     let detail_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(14), // Bid/Ask and Stats
-            Constraint::Min(5),     // K-line/Trend Chart
-        ])
+        .constraints([Constraint::Length(top_height), Constraint::Min(5)])
         .split(rect);
 
     let stock_code = app.selected_stock_code();
@@ -341,7 +380,7 @@ fn render_details(f: &mut Frame, app: &App, rect: Rect) {
 
     match stock {
         Some(s) => {
-            render_bid_ask(f, s, detail_chunks[0]);
+            render_bid_ask(f, app, s, app.quote_meta.get(&s.code), detail_chunks[0]);
             render_chart(f, app, s, detail_chunks[1]);
         }
         None => {
@@ -366,7 +405,7 @@ fn render_details(f: &mut Frame, app: &App, rect: Rect) {
 
 use ratatui::widgets::Cell;
 
-fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
+fn render_bid_ask(f: &mut Frame, app: &App, stock: &Stock, meta: Option<&QuoteMeta>, rect: Rect) {
     // We split this area horizontally: Left for basic stock stats, Right for Level 5 Order Book
     let chunks = Layout::default()
         .direction(Direction::Horizontal)
@@ -385,6 +424,7 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
         COLOR_EVEN
     };
 
+    let overview = app.current_group_overview();
     let stats_text = vec![
         Line::from(vec![Span::styled(
             format!("{} ({})", stock.name, stock.code.to_uppercase()),
@@ -434,6 +474,45 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
             Span::raw("成交额: "),
             Span::raw(format!("{:.2}亿", stock.amount / 100_000_000.0)),
         ]),
+        Line::from(vec![
+            Span::raw("换手: "),
+            Span::raw(format_optional_pct(stock.turnover_rate)),
+            Span::raw(" 量比: "),
+            Span::raw(format_optional_number(stock.volume_ratio)),
+            Span::raw(" 振幅: "),
+            Span::raw(format_optional_pct(stock.amplitude)),
+        ]),
+        Line::from(vec![
+            Span::raw("涨停: "),
+            Span::raw(format_optional_price(stock.limit_up)),
+            Span::raw(" 跌停: "),
+            Span::raw(format_optional_price(stock.limit_down)),
+            Span::raw(" 市值: "),
+            Span::raw(format_optional_market_cap(stock.market_cap)),
+        ]),
+        Line::from(vec![
+            Span::raw("分组: "),
+            Span::raw(format!(
+                "均{:+.2}% 涨{}跌{} 额{:.1}亿",
+                overview.avg_pct_change,
+                overview.rising,
+                overview.falling,
+                overview.total_amount / 100_000_000.0
+            )),
+        ]),
+        Line::from(vec![
+            Span::raw("状态: "),
+            Span::styled(
+                quote_detail_label(meta),
+                Style::default().fg(
+                    if meta.and_then(|meta| meta.last_error.as_ref()).is_some() {
+                        Color::LightRed
+                    } else {
+                        Color::LightCyan
+                    },
+                ),
+            ),
+        ]),
     ];
 
     let stats_block = Block::default()
@@ -444,6 +523,11 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
 
     // 2. 5-Level Book
     let mut rows = Vec::new();
+    rows.push(Row::new(vec![
+        Cell::from("汇总").style(Style::default().fg(Color::Cyan)),
+        Cell::from(format_order_book_summary(stock)),
+        Cell::from(format_imbalance(stock)),
+    ]));
 
     // Sell side (Sell 5 down to Sell 1)
     for i in (0..5).rev() {
@@ -459,8 +543,8 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
             };
             rows.push(Row::new(vec![
                 Cell::from(format!("卖{}", i + 1)).style(Style::default().fg(Color::Gray)),
-                Cell::from(format!("{:.2}", price)).style(Style::default().fg(price_color)),
-                Cell::from(vol.to_string()).style(Style::default().fg(Color::Yellow)),
+                Cell::from(format_order_book_price(price)).style(Style::default().fg(price_color)),
+                Cell::from(format_order_book_volume(vol)).style(Style::default().fg(Color::Yellow)),
             ]));
         }
     }
@@ -489,8 +573,8 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
             };
             rows.push(Row::new(vec![
                 Cell::from(format!("买{}", i + 1)).style(Style::default().fg(Color::Gray)),
-                Cell::from(format!("{:.2}", price)).style(Style::default().fg(price_color)),
-                Cell::from(vol.to_string()).style(Style::default().fg(Color::Yellow)),
+                Cell::from(format_order_book_price(price)).style(Style::default().fg(price_color)),
+                Cell::from(format_order_book_volume(vol)).style(Style::default().fg(Color::Yellow)),
             ]));
         }
     }
@@ -516,7 +600,7 @@ fn render_bid_ask(f: &mut Frame, stock: &Stock, rect: Rect) {
 fn render_chart(f: &mut Frame, app: &App, stock: &Stock, rect: Rect) {
     match app.chart_mode {
         ChartMode::Intraday => render_intraday_chart(f, app, stock, rect),
-        ChartMode::DailyK => render_daily_kline(f, app, stock, rect),
+        period => render_kline_period(f, app, stock, period, rect),
     }
 }
 
@@ -580,6 +664,7 @@ fn render_intraday_price_chart(
         .iter()
         .map(|plot_point| (plot_point.x, plot_point.point.price))
         .collect();
+    let average_data = intraday_average_data(plotted);
     if price_data.is_empty() {
         return;
     }
@@ -627,13 +712,21 @@ fn render_intraday_price_chart(
             .style(Style::default().fg(Color::DarkGray))
             .data(&prev_close_data),
     );
+    datasets.push(
+        Dataset::default()
+            .marker(symbols::Marker::Braille)
+            .graph_type(GraphType::Line)
+            .style(Style::default().fg(Color::Yellow))
+            .data(&average_data),
+    );
+    let stats = intraday_stats(plotted, stock.close);
 
     let price_chart = RatatuiChart::new(datasets)
         .block(
             Block::default()
                 .title(format!(
-                    " 分时图  {} {:.2}  0轴/昨收 {:.2} ",
-                    last.time, last.price, stock.close
+                    " 分时图 {} {:.2} 高{:.2} 低{:.2} 距昨{:+.2}% 均线黄 ",
+                    last.time, last.price, stats.high, stats.low, stats.pct_vs_prev_close
                 ))
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -655,29 +748,29 @@ fn render_intraday_price_chart(
     f.render_widget(price_chart, rect);
 }
 
-/// Renders the daily K-line view or a loading state for the selected stock.
-fn render_daily_kline(f: &mut Frame, app: &App, stock: &Stock, rect: Rect) {
-    if let Some(kline) = app.kline_data.get(&stock.code) {
+/// Renders one historical K-line period or a loading/unavailable state.
+fn render_kline_period(f: &mut Frame, app: &App, stock: &Stock, period: ChartMode, rect: Rect) {
+    if let Some(kline) = app.kline_data.get(&(stock.code.clone(), period)) {
         if !kline.is_empty() {
-            render_candlestick_chart(f, kline, "日K线", rect);
+            render_candlestick_chart(f, kline, period.label(), rect);
             return;
         }
     }
 
     let chart_block = Block::default()
-        .title(" 日K线 ")
+        .title(format!(" {} ", period.label()))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::DarkGray));
     let chart_text = vec![
         Line::from(""),
         Line::from(vec![Span::styled(
-            "  [ 正在加载最近日K历史数据... ]  ",
+            format!("  [ 正在加载最近{}历史数据... ]  ", period.label()),
             Style::default()
                 .add_modifier(Modifier::ITALIC)
                 .fg(Color::Yellow),
         )]),
         Line::from(""),
-        Line::from("  添加股票或切换到日K线时会自动刷新日K数据。"),
+        Line::from("  可用周期会自动刷新；行情源不返回时保持此状态。"),
     ];
     f.render_widget(Paragraph::new(chart_text).block(chart_block), rect);
 }
@@ -716,6 +809,7 @@ fn render_candlestick_chart(f: &mut Frame, kline: &[crate::app::KLine], title: &
     chart.set_bear_color(bear);
     chart.set_vol_bear_color(bear);
     chart.set_volume_pane_unicode_fill('▄');
+    chart.set_candle_width(KLINE_CANDLE_WIDTH);
 
     let chart_str = chart.render();
     f.render_widget(AnsiChart(&chart_str), area);
@@ -929,6 +1023,116 @@ fn kline_to_candles(kline: &[crate::app::KLine]) -> Vec<cli_candlestick_chart::C
         .collect()
 }
 
+/// Formats compact quote state for one watchlist row.
+fn quote_state_label(meta: Option<&QuoteMeta>) -> String {
+    let Some(meta) = meta else {
+        return "缺数据".to_string();
+    };
+    if meta.last_error.is_some() {
+        return "失败".to_string();
+    }
+    match meta.session_state {
+        crate::app::QuoteSessionState::Live => "实时".to_string(),
+        crate::app::QuoteSessionState::ClosedSnapshot => "收盘".to_string(),
+        crate::app::QuoteSessionState::ManualSnapshot => "已更新".to_string(),
+    }
+}
+
+/// Formats detailed quote freshness/source state for the selected stock panel.
+fn quote_detail_label(meta: Option<&QuoteMeta>) -> String {
+    let Some(meta) = meta else {
+        return "未收到行情".to_string();
+    };
+    let age = chrono::Local::now()
+        .signed_duration_since(meta.received_at)
+        .num_seconds()
+        .max(0);
+    let mut parts = Vec::new();
+    if matches!(meta.session_state, crate::app::QuoteSessionState::Live) {
+        parts.push("实时".to_string());
+    } else if matches!(
+        meta.session_state,
+        crate::app::QuoteSessionState::ClosedSnapshot
+    ) {
+        parts.push("收盘".to_string());
+    }
+    parts.push(meta.source.label().to_string());
+    parts.push(format!("{}秒前", age));
+    let mut label = parts.join(" / ");
+    if let Some(error) = &meta.last_error {
+        label.push_str(&format!(" / {}", error));
+    }
+    label
+}
+
+/// Formats optional percent fields returned by quote providers.
+fn format_optional_pct(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.2}%", value))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+/// Formats optional floating-point quote fields.
+fn format_optional_number(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+/// Formats optional price fields.
+fn format_optional_price(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.2}", value))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+/// Formats optional market-cap fields, assuming provider units are hundred-million yuan.
+fn format_optional_market_cap(value: Option<f64>) -> String {
+    value
+        .map(|value| format!("{:.1}亿", value))
+        .unwrap_or_else(|| "--".to_string())
+}
+
+/// Formats valid order-book prices while preserving unavailable levels.
+fn format_order_book_price(price: f64) -> String {
+    if price.is_finite() && price > 0.0 {
+        format!("{:.2}", price)
+    } else {
+        "--".to_string()
+    }
+}
+
+/// Formats valid order-book volumes while preserving unavailable levels.
+fn format_order_book_volume(volume: i64) -> String {
+    if volume > 0 {
+        volume.to_string()
+    } else {
+        "--".to_string()
+    }
+}
+
+/// Formats bid/ask totals and spread for the order-book panel.
+fn format_order_book_summary(stock: &Stock) -> String {
+    let spread = stock
+        .bid_ask_spread()
+        .map(|spread| format!("{:.2}", spread))
+        .unwrap_or_else(|| "--".to_string());
+    format!(
+        "买{} 卖{} 差{}",
+        stock.total_bid_volume(),
+        stock.total_ask_volume(),
+        spread
+    )
+}
+
+/// Formats bid/ask imbalance for the order-book panel.
+fn format_imbalance(stock: &Stock) -> String {
+    stock
+        .order_book_imbalance()
+        .map(|imbalance| format!("{:+.0}%", imbalance * 100.0))
+        .unwrap_or_else(|| "--".to_string())
+}
+
 fn render_footer(f: &mut Frame, app: &App, rect: Rect) {
     let help_chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -968,6 +1172,20 @@ fn render_footer(f: &mut Frame, app: &App, rect: Rect) {
                 .add_modifier(Modifier::BOLD),
         ),
         Span::raw(":切换板块 | "),
+        Span::styled(
+            "s/f",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(":排序/过滤 | "),
+        Span::styled(
+            "l",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw(":布局 | "),
         Span::styled(
             "a",
             Style::default()
@@ -1034,7 +1252,11 @@ fn render_help_popup(f: &mut Frame) {
         help_line("j / ↓", "选择下一只股票，并刷新当前股票行情"),
         help_line("k / ↑", "选择上一只股票，并刷新当前股票行情"),
         help_line("[ / ]", "切换自选股板块"),
-        help_line("t", "在分时图和日K线之间切换"),
+        help_line("t", "循环切换分时、分钟K、日K、周K、月K"),
+        help_line("s", "循环切换自选股排序方式"),
+        help_line("f", "循环切换上涨/下跌/平盘/缺数据过滤"),
+        help_line("/", "按代码或名称文本过滤自选股"),
+        help_line("l", "循环切换平衡、紧凑、大图、盘口布局"),
         help_line("o", "打开或关闭早盘竞价K线弹框"),
         Line::from(""),
         Line::from(vec![Span::styled(
@@ -1045,6 +1267,12 @@ fn render_help_popup(f: &mut Frame) {
         )]),
         help_line("a", "打开添加自选股搜索框"),
         help_line("d", "删除当前选中的自选股"),
+        help_line("g", "新建自选股分组"),
+        help_line("r", "重命名当前分组"),
+        help_line("x", "删除当前分组，至少保留一个分组"),
+        help_line("< / >", "前移或后移当前分组"),
+        help_line("m / c", "移动或复制当前股票到下一个分组"),
+        help_line("e / i", "导出或导入自选股CSV"),
         Line::from(""),
         Line::from(vec![Span::styled(
             "搜索框内",
@@ -1249,6 +1477,42 @@ fn intraday_plot_points(points: &[MinutePoint]) -> Vec<IntradayPlotPoint<'_>> {
         .collect()
 }
 
+/// Computes cumulative average-price line points for validated intraday samples.
+fn intraday_average_data(plotted: &[IntradayPlotPoint<'_>]) -> Vec<(f64, f64)> {
+    let mut sum = 0.0;
+    plotted
+        .iter()
+        .enumerate()
+        .map(|(idx, plot_point)| {
+            sum += plot_point.point.price;
+            (plot_point.x, sum / (idx + 1) as f64)
+        })
+        .collect()
+}
+
+/// Computes high, low, and distance from previous close for an intraday series.
+fn intraday_stats(plotted: &[IntradayPlotPoint<'_>], previous_close: f64) -> IntradayStats {
+    let mut high = f64::NEG_INFINITY;
+    let mut low = f64::INFINITY;
+    let mut last = previous_close;
+    for plot_point in plotted {
+        let price = plot_point.point.price;
+        high = high.max(price);
+        low = low.min(price);
+        last = price;
+    }
+    let pct_vs_prev_close = if previous_close.abs() > f64::EPSILON {
+        (last - previous_close) / previous_close * 100.0
+    } else {
+        0.0
+    };
+    IntradayStats {
+        high,
+        low,
+        pct_vs_prev_close,
+    }
+}
+
 fn render_search_popup(f: &mut Frame, app: &App) {
     let block = Block::default()
         .title(" 添加自选股 ")
@@ -1313,6 +1577,68 @@ fn render_search_popup(f: &mut Frame, app: &App) {
 
     let area = center_rect(60, 14, f.size());
     f.render_widget(Clear, area); // Overwrites anything beneath
+    f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// Renders text input for creating or renaming watchlist groups.
+fn render_group_name_popup(f: &mut Frame, app: &App, action: &GroupNameAction) {
+    let title = match action {
+        GroupNameAction::Create => " 新建分组 ",
+        GroupNameAction::Rename => " 重命名分组 ",
+    };
+    let block = Block::default()
+        .title(title)
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let text = vec![
+        Line::from("输入分组名称:"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("> "),
+            Span::styled(
+                app.text_input.as_str(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter 确认，Esc 取消",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    let area = center_rect(50, 9, f.size());
+    f.render_widget(Clear, area);
+    f.render_widget(Paragraph::new(text).block(block), area);
+}
+
+/// Renders text input for watchlist code/name filtering.
+fn render_filter_text_popup(f: &mut Frame, app: &App) {
+    let block = Block::default()
+        .title(" 文本过滤 ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+    let text = vec![
+        Line::from("输入代码或名称片段:"),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw("> "),
+            Span::styled(
+                app.text_input.as_str(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::UNDERLINED),
+            ),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Enter 应用，空输入清除过滤，Esc 取消",
+            Style::default().fg(Color::Gray),
+        )),
+    ];
+    let area = center_rect(50, 9, f.size());
+    f.render_widget(Clear, area);
     f.render_widget(Paragraph::new(text).block(block), area);
 }
 
@@ -1500,5 +1826,44 @@ mod tests {
         assert_eq!(candles[1].date, "0930");
         assert_eq!(candles[1].open, 10.1);
         assert_eq!(candles[1].close, 10.3);
+    }
+
+    #[test]
+    fn computes_intraday_average_line_and_stats() {
+        let points = vec![
+            MinutePoint {
+                time: "0930".to_string(),
+                price: 10.0,
+                volume: 100.0,
+                amount: 1000.0,
+            },
+            MinutePoint {
+                time: "0931".to_string(),
+                price: 12.0,
+                volume: 120.0,
+                amount: 1440.0,
+            },
+        ];
+        let plotted = intraday_plot_points(&points);
+        let average = intraday_average_data(&plotted);
+        let stats = intraday_stats(&plotted, 10.0);
+
+        assert_eq!(average, vec![(0.0, 10.0), (1.0, 11.0)]);
+        assert_eq!(
+            stats,
+            IntradayStats {
+                high: 12.0,
+                low: 10.0,
+                pct_vs_prev_close: 20.0,
+            }
+        );
+    }
+
+    #[test]
+    fn formats_missing_order_book_levels_as_unavailable() {
+        assert_eq!(format_order_book_price(0.0), "--");
+        assert_eq!(format_order_book_price(10.25), "10.25");
+        assert_eq!(format_order_book_volume(0), "--");
+        assert_eq!(format_order_book_volume(12), "12");
     }
 }

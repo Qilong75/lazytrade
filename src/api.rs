@@ -1,6 +1,9 @@
-use crate::app::{KLine, MarketIndex, MinutePoint, Stock, StockSearchResult};
+use crate::app::{
+    ChartMode, KLine, MarketIndex, MinutePoint, QuoteSessionState, QuoteSource, Stock,
+    StockSearchResult,
+};
 use crate::event::Event;
-use chrono::{Datelike, Local, Timelike, Weekday};
+use chrono::{Datelike, Local, NaiveDate, Timelike, Weekday};
 use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -17,6 +20,31 @@ pub struct ApiClient {
 enum QuoteProvider {
     Tencent,
     Sina,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ProviderCapability {
+    Quote,
+    KLine,
+    Intraday,
+    Index,
+    Search,
+}
+
+impl QuoteProvider {
+    /// Returns source capabilities that are implemented by this provider.
+    fn capabilities(self) -> &'static [ProviderCapability] {
+        match self {
+            QuoteProvider::Tencent => &[
+                ProviderCapability::Quote,
+                ProviderCapability::KLine,
+                ProviderCapability::Intraday,
+                ProviderCapability::Index,
+                ProviderCapability::Search,
+            ],
+            QuoteProvider::Sina => &[ProviderCapability::Quote],
+        }
+    }
 }
 
 impl ApiClient {
@@ -36,6 +64,8 @@ impl ApiClient {
         &self,
         codes: &[String],
     ) -> Result<Vec<Stock>, Box<dyn std::error::Error + Send + Sync>> {
+        let _ = QuoteProvider::Tencent.capabilities();
+        let _ = QuoteProvider::Sina.capabilities();
         if codes.is_empty() {
             return Ok(vec![]);
         }
@@ -209,21 +239,79 @@ impl ApiClient {
         Ok(indices)
     }
 
-    /// Fetches recent daily K-line bars for one A-share code.
-    pub async fn fetch_daily_kline(
+    /// Fetches recent K-line bars for one A-share code and period.
+    pub async fn fetch_kline(
         &self,
         code: &str,
+        period: ChartMode,
         count: usize,
     ) -> Result<Vec<KLine>, Box<dyn std::error::Error + Send + Sync>> {
-        let url = format!(
-            "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},day,,,{count},qfq",
-            code
-        );
+        let Some(period_key) = period.tencent_period() else {
+            return Ok(Vec::new());
+        };
+        let url = if period.is_minute_kline() {
+            format!(
+                "http://ifzq.gtimg.cn/appstock/app/kline/mkline?param={},{},,{}",
+                code, period_key, count
+            )
+        } else {
+            format!(
+                "http://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={},{},,,{count},qfq",
+                code, period_key
+            )
+        };
         let response = self.client.get(&url).send().await?;
         let body = response.text().await?;
         let value: Value = serde_json::from_str(&body)?;
 
-        Ok(parse_daily_kline_json(&value, code))
+        Ok(parse_kline_json(&value, code, period))
+    }
+
+    /// Fetches recent K-line bars for one A-share code and period.
+    async fn fetch_and_send_kline(
+        &self,
+        tx: &mpsc::Sender<Event>,
+        code: &str,
+        period: ChartMode,
+        count: usize,
+    ) {
+        match self.fetch_kline(code, period, count).await {
+            Ok(kline) if !kline.is_empty() => {
+                let _ = tx
+                    .send(Event::KLineUpdate(code.to_string(), period, kline))
+                    .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                let _ = tx
+                    .send(Event::ApiError(format!(
+                        "{}刷新失败({}): {}",
+                        period.label(),
+                        code,
+                        e
+                    )))
+                    .await;
+            }
+        }
+    }
+
+    /// Fetches all historical periods currently supported for a stock.
+    async fn fetch_and_send_all_klines(&self, tx: &mpsc::Sender<Event>, code: &str) {
+        for period in ChartMode::historical_periods() {
+            self.fetch_and_send_kline(tx, code, period, 60).await;
+        }
+    }
+
+    /// Fetches the selected period when it needs historical bars.
+    pub async fn fetch_selected_kline(
+        &self,
+        tx: &mpsc::Sender<Event>,
+        code: String,
+        period: ChartMode,
+    ) {
+        if period.is_kline() {
+            self.fetch_and_send_kline(tx, &code, period, 60).await;
+        }
     }
 
     /// Fetches intraday minute points for one A-share code.
@@ -350,6 +438,12 @@ fn parse_tencent_stock_line(line: &str) -> Option<Stock> {
     let high = data[33].parse::<f64>().unwrap_or(0.0);
     let low = data[34].parse::<f64>().unwrap_or(0.0);
     let amount = parse_tencent_amount_yuan(&data);
+    let turnover_rate = parse_optional_f64(data.get(38).copied());
+    let amplitude = parse_optional_f64(data.get(43).copied());
+    let market_cap = parse_optional_f64(data.get(44).copied());
+    let limit_up = parse_optional_f64(data.get(47).copied());
+    let limit_down = parse_optional_f64(data.get(48).copied());
+    let volume_ratio = parse_optional_f64(data.get(49).copied());
 
     Some(Stock {
         code,
@@ -367,6 +461,13 @@ fn parse_tencent_stock_line(line: &str) -> Option<Stock> {
         bid_volumes,
         ask_prices,
         ask_volumes,
+        quote_source: QuoteSource::Tencent,
+        turnover_rate,
+        volume_ratio,
+        amplitude,
+        market_cap,
+        limit_up,
+        limit_down,
     })
 }
 
@@ -435,7 +536,25 @@ fn parse_sina_stock_line(line: &str) -> Option<Stock> {
         bid_volumes,
         ask_prices,
         ask_volumes,
+        quote_source: QuoteSource::Sina,
+        turnover_rate: None,
+        volume_ratio: None,
+        amplitude: if close.abs() > f64::EPSILON {
+            Some((high - low) / close * 100.0)
+        } else {
+            None
+        },
+        market_cap: None,
+        limit_up: None,
+        limit_down: None,
     })
+}
+
+/// Parses a finite optional f64 field, treating empty and zero-like missing fields as unavailable.
+fn parse_optional_f64(value: Option<&str>) -> Option<f64> {
+    value
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && value.abs() > f64::EPSILON)
 }
 
 /// Converts Sina share volume fields into A-share hands.
@@ -557,8 +676,8 @@ pub fn start_stock_search(tx: mpsc::Sender<Event>, keyword: String) {
     });
 }
 
-/// Parses Tencent daily K-line JSON into ordered bars for one stock code.
-fn parse_daily_kline_json(value: &Value, code: &str) -> Vec<KLine> {
+/// Parses Tencent K-line JSON into ordered bars for one stock code and period.
+fn parse_kline_json(value: &Value, code: &str, period: ChartMode) -> Vec<KLine> {
     let Some(stock_node) = value
         .get("data")
         .and_then(|data| data.get(code))
@@ -572,8 +691,12 @@ fn parse_daily_kline_json(value: &Value, code: &str) -> Vec<KLine> {
         return Vec::new();
     };
 
+    let period_key = period.tencent_period().unwrap_or("day");
+    let qfq_key = format!("qfq{}", period_key);
     let Some(rows) = stock_node
-        .get("qfqday")
+        .get(qfq_key.as_str())
+        .or_else(|| stock_node.get(period_key))
+        .or_else(|| stock_node.get("qfqday"))
         .or_else(|| stock_node.get("day"))
         .and_then(|day| day.as_array())
     else {
@@ -604,15 +727,15 @@ fn parse_json_f64(value: Option<&Value>) -> f64 {
     }
 }
 
-/// Returns true during regular A-share continuous/auction trading sessions.
+/// Returns true during regular A-share continuous trading sessions.
 fn is_a_share_market_open_now() -> bool {
     let now = Local::now();
-    is_a_share_market_open(now.weekday(), now.hour(), now.minute(), now.second())
+    is_a_share_market_open(now.date_naive(), now.hour(), now.minute(), now.second())
 }
 
-/// Checks whether a China-local weekday/time is inside A-share trading hours.
-fn is_a_share_market_open(weekday: Weekday, hour: u32, minute: u32, second: u32) -> bool {
-    if matches!(weekday, Weekday::Sat | Weekday::Sun) {
+/// Checks whether a China-local date/time is inside regular A-share trading hours.
+fn is_a_share_market_open(date: NaiveDate, hour: u32, minute: u32, second: u32) -> bool {
+    if !is_a_share_trading_day(date) {
         return false;
     }
 
@@ -624,6 +747,48 @@ fn is_a_share_market_open(weekday: Weekday, hour: u32, minute: u32, second: u32)
 
     (morning_open..=morning_close).contains(&seconds_since_midnight)
         || (afternoon_open..=afternoon_close).contains(&seconds_since_midnight)
+}
+
+/// Returns true for known A-share trading days after weekend and holiday overrides.
+fn is_a_share_trading_day(date: NaiveDate) -> bool {
+    if static_holiday_overrides().contains(&date) {
+        return false;
+    }
+    if static_workday_overrides().contains(&date) {
+        return true;
+    }
+    !matches!(date.weekday(), Weekday::Sat | Weekday::Sun)
+}
+
+/// Returns known full-day A-share closures maintained in-code for current-year scheduling.
+fn static_holiday_overrides() -> Vec<NaiveDate> {
+    [
+        "2026-01-01",
+        "2026-02-16",
+        "2026-02-17",
+        "2026-02-18",
+        "2026-02-19",
+        "2026-02-20",
+        "2026-04-06",
+        "2026-05-01",
+        "2026-05-04",
+        "2026-05-05",
+        "2026-06-19",
+        "2026-09-25",
+        "2026-10-01",
+        "2026-10-02",
+        "2026-10-05",
+        "2026-10-06",
+        "2026-10-07",
+    ]
+    .iter()
+    .filter_map(|date| NaiveDate::parse_from_str(date, "%Y-%m-%d").ok())
+    .collect()
+}
+
+/// Returns known make-up trading days when they apply to exchanges.
+fn static_workday_overrides() -> Vec<NaiveDate> {
+    Vec::new()
 }
 
 /// Fetches index and stock snapshots, then forwards updates to the event loop.
@@ -648,10 +813,18 @@ async fn fetch_and_send_snapshot(
         return;
     }
 
+    let quote_state = if is_a_share_market_open_now() {
+        QuoteSessionState::Live
+    } else {
+        QuoteSessionState::ClosedSnapshot
+    };
+
     match client.fetch_stocks(&codes).await {
         Ok(stocks) => {
             for stock in stocks {
-                let _ = tx.send(Event::StockUpdate(stock.code.clone(), stock)).await;
+                let _ = tx
+                    .send(Event::StockUpdate(stock.code.clone(), stock, quote_state))
+                    .await;
             }
         }
         Err(e) => {
@@ -666,17 +839,7 @@ async fn fetch_and_send_snapshot(
     }
 
     for code in codes {
-        match client.fetch_daily_kline(&code, 30).await {
-            Ok(kline) if !kline.is_empty() => {
-                let _ = tx.send(Event::KLineUpdate(code, kline)).await;
-            }
-            Ok(_) => {}
-            Err(e) => {
-                let _ = tx
-                    .send(Event::ApiError(format!("日K刷新失败({}): {}", code, e)))
-                    .await;
-            }
-        }
+        client.fetch_and_send_all_klines(tx, &code).await;
     }
 }
 
@@ -690,16 +853,19 @@ async fn fetch_and_send_stock_snapshot(
     match client.fetch_stocks(std::slice::from_ref(&code)).await {
         Ok(stocks) => {
             for stock in stocks {
-                let _ = tx.send(Event::StockUpdate(stock.code.clone(), stock)).await;
+                let quote_state = if include_history {
+                    QuoteSessionState::ManualSnapshot
+                } else {
+                    QuoteSessionState::ClosedSnapshot
+                };
+                let _ = tx
+                    .send(Event::StockUpdate(stock.code.clone(), stock, quote_state))
+                    .await;
             }
         }
         Err(e) => {
-            let _ = tx
-                .send(Event::ApiError(format!(
-                    "个股数据刷新失败({}): {}",
-                    code, e
-                )))
-                .await;
+            let error = format!("个股数据刷新失败({}): {}", code, e);
+            let _ = tx.send(Event::StockError(code.clone(), error)).await;
         }
     }
 
@@ -719,17 +885,7 @@ async fn fetch_and_send_stock_snapshot(
         return;
     }
 
-    match client.fetch_daily_kline(&code, 30).await {
-        Ok(kline) if !kline.is_empty() => {
-            let _ = tx.send(Event::KLineUpdate(code, kline)).await;
-        }
-        Ok(_) => {}
-        Err(e) => {
-            let _ = tx
-                .send(Event::ApiError(format!("日K刷新失败({}): {}", code, e)))
-                .await;
-        }
-    }
+    client.fetch_and_send_all_klines(tx, &code).await;
 }
 
 /// Starts a one-shot quote and daily K-line refresh for the supplied stock codes.
@@ -745,6 +901,14 @@ pub fn start_stock_snapshot_refresh(tx: mpsc::Sender<Event>, code: String, inclu
     tokio::spawn(async move {
         let client = ApiClient::new();
         fetch_and_send_stock_snapshot(&client, &tx, code, include_history).await;
+    });
+}
+
+/// Starts a one-shot K-line refresh for one stock and chart period.
+pub fn start_kline_refresh(tx: mpsc::Sender<Event>, code: String, period: ChartMode) {
+    tokio::spawn(async move {
+        let client = ApiClient::new();
+        client.fetch_selected_kline(&tx, code, period).await;
     });
 }
 
@@ -813,19 +977,25 @@ mod tests {
 
     #[test]
     fn market_open_during_regular_sessions() {
-        assert!(is_a_share_market_open(Weekday::Mon, 9, 30, 0));
-        assert!(is_a_share_market_open(Weekday::Tue, 10, 0, 0));
-        assert!(is_a_share_market_open(Weekday::Wed, 13, 0, 0));
-        assert!(is_a_share_market_open(Weekday::Thu, 14, 59, 59));
+        assert!(is_a_share_market_open(date("2026-07-06"), 9, 30, 0));
+        assert!(is_a_share_market_open(date("2026-07-07"), 10, 0, 0));
+        assert!(is_a_share_market_open(date("2026-07-08"), 13, 0, 0));
+        assert!(is_a_share_market_open(date("2026-07-09"), 14, 59, 59));
     }
 
     #[test]
     fn market_closed_outside_regular_sessions() {
-        assert!(!is_a_share_market_open(Weekday::Fri, 9, 29, 59));
-        assert!(!is_a_share_market_open(Weekday::Fri, 11, 30, 1));
-        assert!(!is_a_share_market_open(Weekday::Fri, 12, 30, 0));
-        assert!(!is_a_share_market_open(Weekday::Fri, 15, 0, 1));
-        assert!(!is_a_share_market_open(Weekday::Sat, 10, 0, 0));
+        assert!(!is_a_share_market_open(date("2026-07-10"), 9, 29, 59));
+        assert!(!is_a_share_market_open(date("2026-07-10"), 11, 30, 1));
+        assert!(!is_a_share_market_open(date("2026-07-10"), 12, 30, 0));
+        assert!(!is_a_share_market_open(date("2026-07-10"), 15, 0, 1));
+        assert!(!is_a_share_market_open(date("2026-07-11"), 10, 0, 0));
+        assert!(!is_a_share_market_open(date("2026-10-01"), 10, 0, 0));
+    }
+
+    /// Parses a YYYY-MM-DD fixture date for trading-calendar tests.
+    fn date(raw: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(raw, "%Y-%m-%d").expect("valid date fixture")
     }
 
     #[test]
@@ -849,6 +1019,38 @@ mod tests {
     }
 
     #[test]
+    fn parses_tencent_extended_quote_fields() {
+        let raw = "v_sh600519=\"1~贵州茅台~600519~1206.29~1168.63~1169.00~50363~30158~20205~1206.29~1~1206.01~2~1206.00~41~1205.85~24~1205.00~2~1206.58~2~1206.89~1~1206.90~15~1207.00~3~1207.01~4~~20260629113629~37.66~3.22~1215.00~1151.01~1206.29/50363/5975724837~50363~597572~0.40~18.23~~1215.00~1151.01~5.48~15079.61~15079.61~6.48~1285.49~1051.77~1.94~45~1186.54~13.84~18.32~~~0.35~597572.4837~0.0000~0\";";
+        let stock = parse_tencent_stock_line(raw).expect("valid Tencent quote");
+
+        assert_eq!(stock.turnover_rate, Some(0.40));
+        assert_eq!(stock.amplitude, Some(5.48));
+        assert_eq!(stock.market_cap, Some(15079.61));
+        assert_eq!(stock.limit_up, Some(1285.49));
+        assert_eq!(stock.limit_down, Some(1051.77));
+        assert_eq!(stock.volume_ratio, Some(1.94));
+    }
+
+    #[test]
+    fn providers_declare_explicit_capabilities() {
+        assert!(
+            QuoteProvider::Tencent
+                .capabilities()
+                .contains(&ProviderCapability::KLine)
+        );
+        assert!(
+            !QuoteProvider::Sina
+                .capabilities()
+                .contains(&ProviderCapability::KLine)
+        );
+        assert!(
+            QuoteProvider::Sina
+                .capabilities()
+                .contains(&ProviderCapability::Quote)
+        );
+    }
+
+    #[test]
     fn parses_sina_quote_into_internal_stock_model() {
         let raw = r#"var hq_str_sh600519="贵州茅台,1169.000,1168.630,1206.290,1215.000,1151.010,1206.290,1206.580,5036261,5975724837.000,100,1206.290,200,1206.010,4100,1206.000,2400,1205.850,200,1205.000,200,1206.580,100,1206.890,1500,1206.900,300,1207.000,400,1207.010,2026-06-29,11:30:00,00,";"#;
         let stock = parse_sina_stock_line(raw).expect("valid Sina quote");
@@ -861,6 +1063,11 @@ mod tests {
         assert_eq!(stock.amount, 5_975_724_837.0);
         assert_eq!(stock.bid_volumes[0], 1);
         assert_eq!(stock.ask_volumes[0], 2);
+        assert_eq!(
+            stock.amplitude.map(|value| (value * 100.0).round() / 100.0),
+            Some(5.48)
+        );
+        assert!(stock.turnover_rate.is_none());
     }
 
     #[test]
@@ -875,5 +1082,34 @@ mod tests {
         assert_eq!(points[0].time, "0930");
         assert_eq!(points[0].price, 1169.0);
         assert_eq!(points[1].amount, 160_552_270.0);
+    }
+
+    #[test]
+    fn parses_tencent_week_kline_points() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"sh600519":{"qfqweek":[["2026-07-03","10.00","11.00","12.00","9.00","1000"]]}}}"#,
+        )
+        .expect("valid json");
+        let bars = parse_kline_json(&value, "sh600519", ChartMode::WeeklyK);
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].date, "2026-07-03");
+        assert_eq!(bars[0].close, 11.0);
+        assert_eq!(bars[0].volume, 1000.0);
+    }
+
+    #[test]
+    fn parses_tencent_minute_kline_points() {
+        let value: Value = serde_json::from_str(
+            r#"{"data":{"sh600519":{"m5":[["202607061420","1208.57","1207.41","1208.57","1207.19","122.00",{},"0.10"]]}}}"#,
+        )
+        .expect("valid json");
+        let bars = parse_kline_json(&value, "sh600519", ChartMode::Minute5);
+
+        assert_eq!(bars.len(), 1);
+        assert_eq!(bars[0].date, "202607061420");
+        assert_eq!(bars[0].open, 1208.57);
+        assert_eq!(bars[0].close, 1207.41);
+        assert_eq!(bars[0].volume, 122.0);
     }
 }

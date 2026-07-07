@@ -46,21 +46,23 @@ impl VolumePane {
         string.color(color).to_string()
     }
 
-    pub fn render(&self, candle: &Candle, y: i64) -> String {
+    /// Renders one volume bar cell at the configured candle width.
+    pub fn render(&self, candle: &Candle, y: i64, candle_width: usize) -> String {
         let max_volume = self.chart_data.borrow().visible_candle_set.max_volume;
         let volume = candle.volume.unwrap_or_default();
+        let candle_width = candle_width.max(1);
 
         let volume_percent_of_max = volume / max_volume;
         let ratio = volume_percent_of_max * self.height as f64;
 
         if y < ratio.ceil() as i64 {
-            return self.colorize(candle.get_type(), &self.unicode_fill.to_string());
+            return self.colorize(candle.get_type(), &self.unicode_fill.to_string().repeat(candle_width));
         }
 
         if y == 1 && self.unicode_fill == '┃' {
-            return self.colorize(candle.get_type(), "╻");
+            return self.colorize(candle.get_type(), &"╻".repeat(candle_width));
         }
 
-        " ".to_string()
+        " ".repeat(candle_width)
     }
 }

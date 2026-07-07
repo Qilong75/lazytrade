@@ -1,4 +1,6 @@
-use crate::app::{KLine, MarketIndex, MinutePoint, Stock, StockSearchResult};
+use crate::app::{
+    ChartMode, KLine, MarketIndex, MinutePoint, QuoteSessionState, Stock, StockSearchResult,
+};
 use crossterm::event::{self, Event as CrosstermEvent, KeyEvent, KeyEventKind};
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -7,8 +9,9 @@ use tokio::sync::mpsc;
 pub enum Event {
     Input(KeyEvent),
     Tick,
-    StockUpdate(String, Stock),
-    KLineUpdate(String, Vec<KLine>),
+    StockUpdate(String, Stock, QuoteSessionState),
+    StockError(String, String),
+    KLineUpdate(String, ChartMode, Vec<KLine>),
     MinuteUpdate(String, Vec<MinutePoint>),
     SearchResultsUpdate(String, Vec<StockSearchResult>),
     IndicesUpdate(Vec<MarketIndex>),

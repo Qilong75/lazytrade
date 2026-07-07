@@ -19,7 +19,7 @@ Guidance for coding agents working in this repository.
 
 ## macOS Packaging
 
-- When updating `dist/lazytrade-macos` or `dist/lazytrade-bin`, always rebuild with `cargo build --release` and copy `target/release/lazytrade` into the intended `dist/` executable.
+- When updating `dist/lazytrade-macos`, always rebuild with `cargo build --release` and copy `target/release/lazytrade` into the intended `dist/` executable.
 - After copying a macOS executable into `dist/`, always run `codesign --force --sign - <dist-binary>`; unsigned or stale-signature binaries can be killed by macOS at launch.
 - After signing, refresh `dist/lazytrade-macos.tar.gz` from the signed `dist/lazytrade-macos` binary so archives do not reintroduce an old executable.
 - Verify packaging changes with `codesign --verify --verbose=4 <dist-binary>` and `cargo test`. If practical, also launch the signed binary from a real terminal because Codex sandbox terminals may not support full TUI startup.

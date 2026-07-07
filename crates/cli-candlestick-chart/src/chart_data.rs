@@ -8,6 +8,7 @@ pub struct ChartData {
     pub visible_candle_set: CandleSet,
     pub terminal_size: (u16, u16),
     pub height: i64,
+    pub candle_width: usize,
 }
 
 impl ChartData {
@@ -17,6 +18,7 @@ impl ChartData {
             visible_candle_set: CandleSet::new(Vec::new()),
             terminal_size: (w, h),
             height: h as i64,
+            candle_width: 1,
         };
 
         chart_data.compute_visible_candles();
@@ -36,8 +38,9 @@ impl ChartData {
     pub fn compute_visible_candles(&mut self) {
         let term_width = self.terminal_size.0 as usize as i64;
         let nb_candles = self.main_candle_set.candles.len();
+        let candle_width = self.candle_width.max(1) as i64;
 
-        let nb_visible_candles = term_width - YAxis::WIDTH;
+        let nb_visible_candles = ((term_width - YAxis::WIDTH).max(1) / candle_width).max(1);
 
         self.visible_candle_set.set_candles(
             self.main_candle_set

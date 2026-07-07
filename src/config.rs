@@ -11,6 +11,31 @@ pub struct StockGroup {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Config {
     pub groups: Vec<StockGroup>,
+    #[serde(default)]
+    pub settings: AppSettings,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct AppSettings {
+    pub layout_mode: String,
+    pub chart_mode: String,
+    pub highlight_pct_threshold: f64,
+    pub highlight_amount_threshold: f64,
+    pub holiday_overrides: Vec<String>,
+    pub workday_overrides: Vec<String>,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            layout_mode: "balanced".to_string(),
+            chart_mode: "intraday".to_string(),
+            highlight_pct_threshold: 5.0,
+            highlight_amount_threshold: 1_000_000_000.0,
+            holiday_overrides: Vec::new(),
+            workday_overrides: Vec::new(),
+        }
+    }
 }
 
 impl Default for Config {
@@ -42,6 +67,7 @@ impl Default for Config {
                     ],
                 },
             ],
+            settings: AppSettings::default(),
         }
     }
 }
@@ -67,6 +93,22 @@ impl Config {
     pub fn kline_cache_dir() -> Option<PathBuf> {
         Self::app_dir().map(|mut p| {
             p.push("kline-cache");
+            p
+        })
+    }
+
+    /// Returns the default CSV export path for watchlist groups.
+    pub fn watchlist_export_path() -> Option<PathBuf> {
+        Self::app_dir().map(|mut p| {
+            p.push("watchlist-export.csv");
+            p
+        })
+    }
+
+    /// Returns the default text/CSV import path for watchlist groups.
+    pub fn watchlist_import_path() -> Option<PathBuf> {
+        Self::app_dir().map(|mut p| {
+            p.push("watchlist-import.csv");
             p
         })
     }

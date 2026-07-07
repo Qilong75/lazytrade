@@ -49,6 +49,7 @@ impl ChartRenderer {
         let low_y = y_axis.price_to_height(candle.low);
         let max_y = y_axis.price_to_height(candle.open.max(candle.close));
         let min_y = y_axis.price_to_height(candle.close.min(candle.open));
+        let candle_width = y_axis.chart_data.borrow().candle_width.max(1);
 
         let mut output = ChartRenderer::UNICODE_VOID;
 
@@ -85,10 +86,10 @@ impl ChartRenderer {
         }
 
         if output == ChartRenderer::UNICODE_VOID {
-            output.to_string()
+            " ".repeat(candle_width)
         } else {
-            let mut tmp = [0; 4];
-            self.colorize(candle.get_type(), output.encode_utf8(&mut tmp))
+            let expanded = expand_candle_char(output, candle_width);
+            self.colorize(candle.get_type(), &expanded)
         }
     }
 
@@ -104,10 +105,10 @@ impl ChartRenderer {
         for y in (1..chart_data.height as u16).rev() {
             output_str += "\n";
 
-            output_str += &chart.y_axis.render_line(y);
+                output_str += &chart.y_axis.render_line(y);
 
-            for candle in chart_data.visible_candle_set.candles.iter() {
-                output_str += &self.render_candle(candle, y.into(), &chart.y_axis);
+                for candle in chart_data.visible_candle_set.candles.iter() {
+                    output_str += &self.render_candle(candle, y.into(), &chart.y_axis);
             }
         }
 
@@ -118,7 +119,9 @@ impl ChartRenderer {
                 output_str += &chart.y_axis.render_empty();
 
                 for candle in chart_data.visible_candle_set.candles.iter() {
-                    output_str += &chart.volume_pane.render(candle, y);
+                    output_str += &chart
+                        .volume_pane
+                        .render(candle, y, chart_data.candle_width.max(1));
                 }
             }
         }
@@ -126,6 +129,24 @@ impl ChartRenderer {
         output_str += &chart.info_bar.render();
 
         output_str
+    }
+}
+
+/// Expands one candle glyph to the configured cell width, centering wick-only glyphs.
+fn expand_candle_char(output: char, width: usize) -> String {
+    if width <= 1 {
+        return output.to_string();
+    }
+
+    match output {
+        ChartRenderer::UNICODE_WICK
+        | ChartRenderer::UNICODE_UPPER_WICK
+        | ChartRenderer::UNICODE_LOWER_WICK => {
+            let left = width / 2;
+            let right = width.saturating_sub(left + 1);
+            format!("{}{}{}", " ".repeat(left), output, " ".repeat(right))
+        }
+        _ => output.to_string().repeat(width),
     }
 }
 

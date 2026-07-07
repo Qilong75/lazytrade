@@ -23,9 +23,10 @@ impl InfoBar {
 
         let candles = visible_set.candles;
         let mut output_str = String::new();
+        let candle_area_width = candles.len() * chart_data.candle_width.max(1);
 
         output_str += "\n";
-        output_str += &"─".repeat(candles.len() + YAxis::WIDTH as usize);
+        output_str += &"─".repeat(candle_area_width + YAxis::WIDTH as usize);
         output_str += "\n";
 
         let mut avg_format = format!("{:.2}", main_set.average);

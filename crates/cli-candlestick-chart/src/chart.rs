@@ -142,4 +142,11 @@ impl Chart {
     pub fn set_volume_pane_height(&mut self, height: i64) {
         self.volume_pane.height = height;
     }
+
+    /// Sets the rendered character width of each candle body and volume bar.
+    pub fn set_candle_width(&mut self, width: usize) {
+        let mut chart_data = self.chart_data.borrow_mut();
+        chart_data.candle_width = width.max(1);
+        chart_data.compute_visible_candles();
+    }
 }

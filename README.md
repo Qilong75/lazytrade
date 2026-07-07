@@ -10,18 +10,26 @@ Rust terminal watchlist for A-share market quotes.
 - Live quote source: Tencent Finance `qt.gtimg.cn`.
 - Mock market data: removed. The UI only fills from real quote responses.
 - Polling: live cadence during regular A-share trading sessions; one snapshot refresh outside trading hours.
-- Chart panel: intraday minute price/volume and recent daily K-line views are available when Tencent returns the data.
+- Chart panel: intraday minute price/volume and minute/daily/weekly/monthly K-line views are available when Tencent returns the data.
 - Scope: pure market-watch TUI. AI summaries, deep analysis pipelines, and local agent skills are intentionally excluded.
 
 ## Features
 
 - Watchlist groups with persisted local configuration.
 - Live A-share stock quote refresh during market hours.
+- In-TUI group create/rename/delete/reorder plus stock move/copy between groups.
+- Watchlist sorting by code, change, percent change, volume, or amount.
+- Watchlist filters for rising, falling, unchanged, missing-data, and text/code matches.
+- Quote freshness labels showing source, update age, live/snapshot state, and per-stock refresh errors.
+- Purple watchlist highlighting for board-aware high-gain or high-loss rows.
+- Group overview metrics for breadth, average change, leaders, laggards, and total amount.
+- Configurable layouts for balanced, compact, large-chart, and order-book focused views.
+- CSV watchlist import/export from the app config directory.
 - Three index slots for 上证指数, 深证成指, 创业板指.
 - Stock table with price, change, and percentage change.
-- Detail panel with open, previous close, high, low, volume, amount.
-- Level-5 bid/ask order book when returned by Tencent.
-- Intraday price/volume chart and daily K-line chart toggle.
+- Detail panel with open, previous close, high, low, volume, amount, turnover, volume ratio, amplitude, limit prices, and market cap when source-backed.
+- Level-5 bid/ask order book with totals, spread, and imbalance when returned by Tencent.
+- Intraday price/volume chart with average-price line and multi-period K-line chart toggle.
 - Keyboard-driven add/delete/navigation workflow.
 
 ## Market Data Behavior
@@ -40,9 +48,9 @@ The polling loop requests data every `3s` during regular A-share sessions:
 Monday-Friday
 ```
 
-Outside trading hours it fetches one snapshot so the UI can still show the latest available quote snapshot, including the most recent close/open/high/low/volume fields returned by Tencent. It also fetches recent daily K-line history and intraday minute points for configured watchlist stocks when available. After that, it only checks the clock every `60s` until the market opens, unless the watchlist codes change.
+Outside trading hours it fetches one snapshot so the UI can still show the latest available quote snapshot, including the most recent close/open/high/low/volume fields returned by Tencent. It also fetches recent K-line history and intraday minute points for configured watchlist stocks when available. After that, it only checks the clock every `60s` until the market opens, unless the watchlist codes change.
 
-Holiday calendars and ad-hoc market closures are not currently modeled.
+The polling gate includes a maintained A-share holiday override table for known 2026 full-day closures, plus normal weekday/weekend rules.
 
 ## Install And Run
 
@@ -84,6 +92,10 @@ j / Down    Select next stock
 k / Up      Select previous stock
 [          Previous group
 ]          Next group
+s          Cycle sort mode
+f          Cycle quick filter
+/          Text/code filter
+l          Cycle layout mode
 ```
 
 The left panel shows the current group. The right panel shows details for the selected stock once live data has been fetched.
@@ -110,23 +122,28 @@ Select the stock in the left watchlist and press `d`.
 
 The stock is removed from the current group and the config file is saved immediately.
 
-### 6. Edit groups manually
+### 6. Manage groups
 
-The TUI currently supports adding/deleting stocks inside existing groups. To rename groups, reorder groups, or create new groups, edit the config file directly:
+Use:
+
+```text
+g          Create a group
+r          Rename the active group
+x          Delete the active group
+< / >      Move the active group left/right
+m          Move selected stock to the next group
+c          Copy selected stock to the next group
+e          Export watchlists to CSV
+i          Import watchlists from CSV
+```
+
+Group and stock-list changes are saved immediately to:
 
 ```text
 ~/Library/Application Support/lazytrade/config.toml
 ```
 
-Example:
-
-```toml
-[[groups]]
-name = "光通信"
-stocks = ["sh600487", "sh601869"]
-```
-
-Restart the app after editing the config file.
+If saving fails, the status bar reports the error.
 
 ### 7. Read quote fields
 
@@ -134,9 +151,11 @@ When live data is available:
 
 - Top bar shows major indices.
 - Left table shows code, name, last price, change, and percent change.
-- Right detail panel shows open, previous close, high, low, volume, and amount.
-- Right order-book panel shows five-level bid/ask prices and volumes.
-- Bottom chart panel toggles between intraday price/volume and daily K-line views with `t`.
+- Rows with high percent gain or high percent loss are marked with purple attention styling: 10cm stocks at `>= 6%` absolute move, and 20cm stocks at `>= 12%` absolute move.
+- Right detail panel shows open, previous close, high, low, volume, amount, turnover, volume ratio, amplitude, limit prices, market cap, and group overview when source-backed.
+- Detail status shows quote source, whether the data is live or a snapshot, update age, and the latest per-stock refresh error when present.
+- Right order-book panel shows five-level bid/ask prices, volumes, total bid/ask volume, spread, and imbalance.
+- Bottom chart panel toggles between intraday price/volume and `5m/15m/30m/60m/day/week/month` K-line views with `t`; intraday view includes a yellow average-price line.
 
 Useful development commands:
 
@@ -155,7 +174,17 @@ j/k     Move selected stock down/up
 a       Add stock to current group
 Up/Down Select add-stock search result
 d       Delete selected stock from current group
-t       Toggle chart mode label between intraday and daily K
+s       Cycle watchlist sort mode
+f       Cycle quick filter
+/       Apply text/code filter
+g       Create watchlist group
+r       Rename current group
+x       Delete current group
+< / >   Reorder current group
+m / c   Move/copy selected stock to next group
+l       Cycle layout mode
+e / i   Export/import watchlists CSV
+t       Cycle chart period
 Esc     Cancel add-stock input
 Enter   Confirm add-stock input
 ```
@@ -190,11 +219,17 @@ stocks = ["sh600519", "sz000001", "sh601318"]
 [[groups]]
 name = "科技半导体"
 stocks = ["sh688981", "sz300750", "sz002415"]
+
+[settings]
+layout_mode = "balanced"
+chart_mode = "intraday"
+holiday_overrides = []
+workday_overrides = []
 ```
 
 The app creates a default config on first launch if no config file exists.
 
-Daily K-line history is cached as per-stock JSON files under:
+K-line history is cached as per-stock, per-period JSON files under:
 
 ```text
 {config_dir}/lazytrade/kline-cache/
@@ -206,7 +241,16 @@ On macOS this is usually:
 ~/Library/Application Support/lazytrade/kline-cache/
 ```
 
-The app loads this cache at startup and overwrites each stock's cache file when fresh daily K-line data is fetched.
+The app loads this cache at startup and overwrites each stock-period cache file when fresh K-line data is fetched. Older daily cache files named `{code}.json` are still read as a fallback for the daily view.
+
+Watchlist CSV import/export uses:
+
+```text
+{config_dir}/lazytrade/watchlist-import.csv
+{config_dir}/lazytrade/watchlist-export.csv
+```
+
+CSV rows use `group,code`; single-column rows import into the active group.
 
 ## Project Layout
 
@@ -226,8 +270,7 @@ The Rust TUI currently uses Tencent realtime quote and K-line endpoints. No AI s
 
 ## Limitations
 
-- No holiday calendar; weekend/time-window rules only.
-- The `r` key updates status text but does not yet trigger an immediate fetch.
+- The built-in holiday table must be maintained as exchange calendars are announced.
 - Quote parsing depends on Tencent's field order and availability.
 
 ## License

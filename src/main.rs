@@ -4,7 +4,7 @@ mod config;
 mod event;
 mod ui;
 
-use app::{AddStockStatus, App, InputMode};
+use app::{AddStockStatus, App, GroupNameAction, InputMode};
 use crossterm::{
     cursor,
     event::KeyCode,
@@ -147,20 +147,101 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                             }
                             KeyCode::Char('t') => {
-                                app.chart_mode = match app.chart_mode {
-                                    app::ChartMode::Intraday => app::ChartMode::DailyK,
-                                    app::ChartMode::DailyK => app::ChartMode::Intraday,
-                                };
+                                app.chart_mode = app.chart_mode.next();
+                                app.persist_chart_mode();
                                 if let Some(code) = app.selected_stock_code() {
-                                    match app.chart_mode {
-                                        app::ChartMode::Intraday => {
-                                            app.status_message =
-                                                Some(format!("正在刷新分时数据: {}", code));
-                                        }
-                                        app::ChartMode::DailyK => {
-                                            app.status_message =
-                                                Some(format!("正在刷新日K数据: {}", code));
-                                        }
+                                    if app.chart_mode.is_kline() {
+                                        app.status_message = Some(format!(
+                                            "正在刷新{}数据: {}",
+                                            app.chart_mode.label(),
+                                            code
+                                        ));
+                                        api::start_kline_refresh(
+                                            refresh_tx.clone(),
+                                            code,
+                                            app.chart_mode,
+                                        );
+                                    } else {
+                                        app.status_message =
+                                            Some(format!("正在刷新分时数据: {}", code));
+                                        api::start_stock_snapshot_refresh(
+                                            refresh_tx.clone(),
+                                            code,
+                                            true,
+                                        );
+                                    }
+                                }
+                            }
+                            KeyCode::Char('s') => {
+                                app.cycle_sort_mode();
+                            }
+                            KeyCode::Char('l') => {
+                                app.cycle_layout_mode();
+                            }
+                            KeyCode::Char('e') => {
+                                app.export_watchlists();
+                            }
+                            KeyCode::Char('i') => {
+                                app.import_watchlists();
+                                let updated_codes = get_all_stock_codes(&app);
+                                if let Ok(mut lock) = codes_to_poll.lock() {
+                                    *lock = updated_codes;
+                                }
+                                api::start_snapshot_refresh(
+                                    refresh_tx.clone(),
+                                    get_all_stock_codes(&app),
+                                    true,
+                                );
+                            }
+                            KeyCode::Char('f') => {
+                                app.cycle_filter_mode();
+                            }
+                            KeyCode::Char('/') => {
+                                app.input_mode = InputMode::FilterText;
+                                app.clear_text_input();
+                            }
+                            KeyCode::Char('g') => {
+                                app.input_mode = InputMode::GroupName(GroupNameAction::Create);
+                                app.clear_text_input();
+                            }
+                            KeyCode::Char('r') => {
+                                app.input_mode = InputMode::GroupName(GroupNameAction::Rename);
+                                app.text_input = app
+                                    .current_group()
+                                    .map(|group| group.name.clone())
+                                    .unwrap_or_default();
+                            }
+                            KeyCode::Char('x') => {
+                                app.delete_current_group();
+                                let updated_codes = get_all_stock_codes(&app);
+                                if let Ok(mut lock) = codes_to_poll.lock() {
+                                    *lock = updated_codes;
+                                }
+                            }
+                            KeyCode::Char('<') => {
+                                app.move_current_group_left();
+                            }
+                            KeyCode::Char('>') => {
+                                app.move_current_group_right();
+                            }
+                            KeyCode::Char('m') => {
+                                if let Some(code) = app.move_selected_stock_to_next_group() {
+                                    let updated_codes = get_all_stock_codes(&app);
+                                    if let Ok(mut lock) = codes_to_poll.lock() {
+                                        *lock = updated_codes;
+                                    }
+                                    api::start_stock_snapshot_refresh(
+                                        refresh_tx.clone(),
+                                        code,
+                                        true,
+                                    );
+                                }
+                            }
+                            KeyCode::Char('c') => {
+                                if let Some(code) = app.copy_selected_stock_to_next_group() {
+                                    let updated_codes = get_all_stock_codes(&app);
+                                    if let Ok(mut lock) = codes_to_poll.lock() {
+                                        *lock = updated_codes;
                                     }
                                     api::start_stock_snapshot_refresh(
                                         refresh_tx.clone(),
@@ -252,16 +333,66 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             _ => {}
                         },
+                        InputMode::GroupName(ref action) => match key.code {
+                            KeyCode::Enter => {
+                                match action {
+                                    GroupNameAction::Create => {
+                                        app.create_group(app.text_input.clone());
+                                    }
+                                    GroupNameAction::Rename => {
+                                        app.rename_current_group(app.text_input.clone());
+                                    }
+                                }
+                                app.input_mode = InputMode::Normal;
+                                app.clear_text_input();
+                            }
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                app.clear_text_input();
+                            }
+                            KeyCode::Backspace => {
+                                app.text_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                if !c.is_control() && app.text_input.chars().count() < 24 {
+                                    app.text_input.push(c);
+                                }
+                            }
+                            _ => {}
+                        },
+                        InputMode::FilterText => match key.code {
+                            KeyCode::Enter => {
+                                app.apply_text_filter(app.text_input.clone());
+                                app.input_mode = InputMode::Normal;
+                                app.clear_text_input();
+                            }
+                            KeyCode::Esc => {
+                                app.input_mode = InputMode::Normal;
+                                app.clear_text_input();
+                            }
+                            KeyCode::Backspace => {
+                                app.text_input.pop();
+                            }
+                            KeyCode::Char(c) => {
+                                if !c.is_control() && app.text_input.chars().count() < 24 {
+                                    app.text_input.push(c);
+                                }
+                            }
+                            _ => {}
+                        },
                     }
                 }
                 Event::Tick => {
                     // Tick event triggers redrawing (loop cycles)
                 }
-                Event::StockUpdate(code, stock) => {
-                    app.stock_data.insert(code, stock);
+                Event::StockUpdate(code, stock, state) => {
+                    app.record_stock_update(code, stock, state);
                 }
-                Event::KLineUpdate(code, kline) => {
-                    app.update_kline_data(code, kline);
+                Event::StockError(code, err) => {
+                    app.record_stock_error(code, err);
+                }
+                Event::KLineUpdate(code, period, kline) => {
+                    app.update_kline_data(code, period, kline);
                 }
                 Event::MinuteUpdate(code, points) => {
                     app.intraday_data.insert(code, points);
